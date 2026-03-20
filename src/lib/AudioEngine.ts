@@ -1,12 +1,13 @@
 /**
- * 音声処理を管理する基本エンジン
+ * Audio preview engine for seamless loop playback.
  */
 export class AudioEngine {
   private context: AudioContext | null = null;
   private buffer: AudioBuffer | null = null;
-  private sourceNode: AudioBufferSourceNode | null = null;
-  private isPlaying: boolean = false;
-  private nextTimeoutId: any = null;
+  private isPlaying = false;
+  private schedulerId: number | null = null;
+  private scheduledSources: Array<{ source: AudioBufferSourceNode; gain: GainNode }> = [];
+  private nextStartTime = 0;
 
   constructor() {
     if (typeof window !== "undefined") {
@@ -45,12 +46,11 @@ export class AudioEngine {
     return segment;
   }
 
-  /**
-   * シームレスループのプレビュー
-   * クロスフェードを用いて繋ぎ目を滑らかにする
-   */
   playSeamlessLoop(crossfadeDuration: number = 2.0, start?: number, end?: number) {
     if (!this.context || !this.buffer) return;
+    if (this.context.state === "suspended") {
+      void this.context.resume();
+    }
 
     this.stop();
     this.isPlaying = true;
@@ -62,68 +62,81 @@ export class AudioEngine {
       Number.isFinite(end) &&
       end > start;
 
-    const playBuffer = hasRange ? this.createSegmentBuffer(start!, end!) || this.buffer : this.buffer;
+    const playBuffer = hasRange ? this.createSegmentBuffer(start, end) || this.buffer : this.buffer;
     const duration = playBuffer.duration;
-    // ループ実効長 = 全体長 - クロスフェード長
     const effectiveDuration = duration - crossfadeDuration;
 
     if (effectiveDuration <= 0) {
       console.warn("Crossfade duration is longer than audio duration.");
+      this.isPlaying = false;
       return;
     }
 
-    const play = () => {
-      if (!this.context || !playBuffer || !this.isPlaying) return;
+    const scheduleSource = (startTime: number) => {
+      if (!this.context || !this.isPlaying) return;
 
       const source = this.context.createBufferSource();
       source.buffer = playBuffer;
-      
+
       const gain = this.context.createGain();
-      
       source.connect(gain);
       gain.connect(this.context.destination);
 
-      const now = this.context.currentTime;
+      if (crossfadeDuration > 0) {
+        const fadeInDuration = Math.min(0.1, crossfadeDuration);
+        const fadeOutStart = startTime + effectiveDuration;
 
-      // クロスフェードのスケジューリング
-      gain.gain.setValueAtTime(0, now);
-      gain.gain.linearRampToValueAtTime(1, now + (crossfadeDuration > 0.1 ? 0.1 : crossfadeDuration)); // 開始時のプチノイズ防止
-      
-      // 次のループ開始の少し前にフェードアウトを開始するのではなく、
-      // 次の音が重なり始めるタイミング（effectiveDuration）で現在の音をフェードアウトさせる
-      const fadeOutStart = now + effectiveDuration;
-      gain.gain.setValueAtTime(1, fadeOutStart);
-      gain.gain.linearRampToValueAtTime(0, fadeOutStart + crossfadeDuration);
+        gain.gain.setValueAtTime(0, startTime);
+        gain.gain.linearRampToValueAtTime(1, startTime + fadeInDuration);
+        gain.gain.setValueAtTime(1, fadeOutStart);
+        gain.gain.linearRampToValueAtTime(0, fadeOutStart + crossfadeDuration);
+      } else {
+        gain.gain.setValueAtTime(1, startTime);
+      }
 
-      source.start(now);
-      source.stop(now + effectiveDuration + crossfadeDuration);
+      source.onended = () => {
+        this.scheduledSources = this.scheduledSources.filter((entry) => entry.source !== source);
+        source.disconnect();
+        gain.disconnect();
+      };
 
-      this.sourceNode = source;
-
-      // 次のループをスケジュール
-      this.nextTimeoutId = setTimeout(() => {
-        if (this.isPlaying) {
-          play();
-        }
-      }, effectiveDuration * 1000);
+      source.start(startTime);
+      source.stop(startTime + duration);
+      this.scheduledSources.push({ source, gain });
     };
 
-    play();
+    const scheduleAheadTime = Math.max(0.25, Math.min(1, effectiveDuration));
+    const schedulerIntervalMs = Math.max(50, Math.min(250, effectiveDuration * 250));
+    this.nextStartTime = this.context.currentTime;
+
+    const pumpScheduler = () => {
+      if (!this.context || !this.isPlaying) return;
+      while (this.nextStartTime < this.context.currentTime + scheduleAheadTime) {
+        scheduleSource(this.nextStartTime);
+        this.nextStartTime += effectiveDuration;
+      }
+    };
+
+    pumpScheduler();
+    this.schedulerId = window.setInterval(pumpScheduler, schedulerIntervalMs);
   }
 
   stop() {
     this.isPlaying = false;
-    
-    if (this.nextTimeoutId) {
-      clearTimeout(this.nextTimeoutId);
-      this.nextTimeoutId = null;
+
+    if (this.schedulerId !== null) {
+      window.clearInterval(this.schedulerId);
+      this.schedulerId = null;
     }
 
-    if (this.sourceNode) {
+    for (const { source, gain } of this.scheduledSources) {
       try {
-        this.sourceNode.stop();
-      } catch (e) {}
-      this.sourceNode = null;
+        source.stop();
+      } catch {}
+      source.disconnect();
+      gain.disconnect();
     }
+
+    this.scheduledSources = [];
   }
 }

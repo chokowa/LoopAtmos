@@ -65,9 +65,12 @@ export default function Home() {
   const [layerPreviewTokens, setLayerPreviewTokens] = useState<Record<string, number>>({});
   const [renderError, setRenderError] = useState<string | null>(null);
   const [previewSource, setPreviewSource] = useState<"source" | "rendered">("source");
+  const [mainSourceDuration, setMainSourceDuration] = useState<number | null>(null);
+  const [layerSourceDurations, setLayerSourceDurations] = useState<Record<string, number>>({});
 
   const audioEngine = useRef<AudioEngine | null>(null);
   const exportEngine = useRef<ExportEngine | null>(null);
+  const pendingDurationIdsRef = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     audioEngine.current = new AudioEngine();
@@ -93,10 +96,24 @@ export default function Home() {
     }
   }, [previewSource, generatedFile]);
 
+  useEffect(() => {
+    const existingIds = new Set(combinedFiles.map((item) => item.id));
+    setLayerSourceDurations((prev) => {
+      const next: Record<string, number> = {};
+      for (const [id, value] of Object.entries(prev)) {
+        if (existingIds.has(id)) {
+          next[id] = value;
+        }
+      }
+      return next;
+    });
+  }, [combinedFiles]);
+
   const handleMainFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const selectedFile = e.target.files?.[0];
     if (selectedFile) {
       setMainFile(selectedFile);
+      setMainSourceDuration(null);
       audioEngine.current?.stop();
       setIsSeamlessPlaying(false);
       setGeneratedFile(null);
@@ -121,6 +138,11 @@ export default function Home() {
       setIsSeamlessPlaying(false);
     }
     setLayerLoopRanges((prev) => {
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+    setLayerSourceDurations((prev) => {
       const next = { ...prev };
       delete next[id];
       return next;
@@ -186,9 +208,15 @@ export default function Home() {
   };
 
   const parseTargetDuration = () => {
-    const value = Number.parseFloat(targetDuration);
-    if (!Number.isFinite(value)) return null;
-    return value > 0 ? value : null;
+    const rawValue = targetDuration.trim();
+    if (!rawValue) return undefined;
+
+    const value = Number.parseFloat(rawValue);
+    if (!Number.isFinite(value) || value <= 0) {
+      throw new Error("Target duration must be greater than 0.");
+    }
+
+    return value;
   };
 
   const getAudioDuration = async (file: File) => {
@@ -200,6 +228,62 @@ export default function Home() {
     } finally {
       await ctx.close();
     }
+  };
+
+  useEffect(() => {
+    if (!combinedFiles.length) return;
+
+    let cancelled = false;
+    const loadMissingDurations = async () => {
+      for (const item of combinedFiles) {
+        if (layerSourceDurations[item.id] !== undefined) continue;
+        if (pendingDurationIdsRef.current.has(item.id)) continue;
+        pendingDurationIdsRef.current.add(item.id);
+        try {
+          const duration = await getAudioDuration(item.file);
+          if (cancelled) return;
+          setLayerSourceDurations((prev) => {
+            if (prev[item.id] !== undefined) return prev;
+            return { ...prev, [item.id]: duration };
+          });
+        } catch {
+          // Ignore metadata analysis failure for estimate display.
+        } finally {
+          pendingDurationIdsRef.current.delete(item.id);
+        }
+      }
+    };
+
+    void loadMissingDurations();
+    return () => {
+      cancelled = true;
+    };
+  }, [combinedFiles, layerSourceDurations]);
+
+  const parseTargetDurationDraft = () => {
+    const rawValue = targetDuration.trim();
+    if (!rawValue) {
+      return { value: undefined as number | undefined, invalid: false };
+    }
+    const value = Number.parseFloat(rawValue);
+    if (!Number.isFinite(value) || value <= 0) {
+      return { value: undefined as number | undefined, invalid: true };
+    }
+    return { value, invalid: false };
+  };
+
+  const formatDurationLabel = (seconds: number) => {
+    if (!Number.isFinite(seconds) || seconds < 0) return "--";
+    const total = Math.max(0, seconds);
+    const hours = Math.floor(total / 3600);
+    const minutes = Math.floor((total % 3600) / 60);
+    const secs = total % 60;
+    if (hours > 0) {
+      return `${hours}:${minutes.toString().padStart(2, "0")}:${secs
+        .toFixed(2)
+        .padStart(5, "0")}`;
+    }
+    return `${minutes}:${secs.toFixed(2).padStart(5, "0")}`;
   };
 
   const computeLoopCandidates = async (file: File, overlap: number, count: number) => {
@@ -308,8 +392,7 @@ export default function Home() {
       let blob: Blob;
       let filename: string;
 
-      const requestedDuration = parseTargetDuration();
-      const targetSeconds = requestedDuration ?? undefined;
+      const targetSeconds = parseTargetDuration();
       const requestedPeak = Number.parseFloat(normalizePeakDb);
       const requestedLufs = Number.parseFloat(normalizeLufs);
       const requestedTruePeak = Number.parseFloat(normalizeTruePeak);
@@ -342,9 +425,6 @@ export default function Home() {
         let sourceDuration: number | undefined;
         if (targetSeconds) {
           sourceDuration = await getAudioDuration(mainFile);
-          if (targetSeconds <= 0) {
-            throw new Error("Target duration must be greater than 0.");
-          }
         }
         if (singleLoopRange && singleLoopRange.end > singleLoopRange.start) {
           sourceDuration = singleLoopRange.end - singleLoopRange.start;
@@ -371,9 +451,6 @@ export default function Home() {
           sourceDurations = await Promise.all(
             combinedFiles.map((item) => getAudioDuration(item.file))
           );
-          if (targetSeconds <= 0) {
-            throw new Error("Target duration must be greater than 0.");
-          }
         }
         if (sourceDurations) {
           sourceDurations = sourceDurations.map((value, index) => {
@@ -404,7 +481,6 @@ export default function Home() {
         );
         filename = "combined_loop.wav";
       } else {
-        setIsProcessing(false);
         return;
       }
 
@@ -476,6 +552,35 @@ export default function Home() {
   const hasSource = activeTab === "single" ? !!mainFile : combinedFiles.length > 0;
   const hasPreviewTarget = previewSource === "rendered" ? !!generatedFile : hasSource;
   const activeLayer = combinedFiles.find((file) => file.id === activeLayerId) || null;
+  const targetDraft = parseTargetDurationDraft();
+
+  const estimatedRenderSeconds = (() => {
+    if (!hasSource || targetDraft.invalid) return undefined;
+    if (typeof targetDraft.value === "number") return targetDraft.value;
+
+    const crossfadePenalty = crossfadeDuration > 0 ? crossfadeDuration : 0;
+    if (activeTab === "single") {
+      const baseDuration =
+        singleLoopRange && singleLoopRange.end > singleLoopRange.start
+          ? singleLoopRange.end - singleLoopRange.start
+          : mainSourceDuration ?? undefined;
+      if (typeof baseDuration !== "number") return undefined;
+      return Math.max(0, baseDuration - crossfadePenalty);
+    }
+
+    const segmentDurations: number[] = [];
+    for (const item of combinedFiles) {
+      const loopRange = layerLoopRanges[item.id];
+      const segmentDuration =
+        loopRange && loopRange.end > loopRange.start
+          ? loopRange.end - loopRange.start
+          : layerSourceDurations[item.id];
+      if (typeof segmentDuration !== "number") return undefined;
+      segmentDurations.push(segmentDuration);
+    }
+    const baseTotal = segmentDurations.reduce((acc, value) => acc + value, 0);
+    return Math.max(0, baseTotal - crossfadePenalty * combinedFiles.length);
+  })();
 
   return (
     <main className="min-h-screen bg-app text-app">
@@ -599,7 +704,13 @@ export default function Home() {
                         </p>
                       </div>
                     </div>
-                    <button className="btn btn-ghost shrink-0" onClick={() => setMainFile(null)}>
+                    <button
+                      className="btn btn-ghost shrink-0"
+                      onClick={() => {
+                        setMainFile(null);
+                        setMainSourceDuration(null);
+                      }}
+                    >
                       Change
                     </button>
                   </div>
@@ -658,6 +769,7 @@ export default function Home() {
                     loopEnd={singleLoopRange?.end}
                     onLoopChange={(start, end) => setSingleLoopRange({ start, end })}
                     onDuration={(duration) => {
+                      setMainSourceDuration(duration);
                       if (!singleLoopRange) {
                         setSingleLoopRange({ start: 0, end: duration });
                       }
@@ -673,9 +785,17 @@ export default function Home() {
                         onClick={async () => {
                           if (!mainFile) return;
                           setDetectingSingle(true);
-                          const results = await computeLoopCandidates(mainFile, crossfadeDuration, 3);
-                          setSingleCandidates(results);
-                          setDetectingSingle(false);
+                          setRenderError(null);
+                          try {
+                            const results = await computeLoopCandidates(mainFile, crossfadeDuration, 3);
+                            setSingleCandidates(results);
+                          } catch (err: any) {
+                            const message = err?.message || "Loop detection failed.";
+                            console.error(err);
+                            setRenderError(message);
+                          } finally {
+                            setDetectingSingle(false);
+                          }
                         }}
                         disabled={detectingSingle}
                       >
@@ -690,7 +810,7 @@ export default function Home() {
                             className="flex items-center justify-between rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-xs"
                           >
                             <span className="text-white/70">
-                              {candidate.start.toFixed(2)}s → {candidate.end.toFixed(2)}s
+                              {candidate.start.toFixed(2)}s - {candidate.end.toFixed(2)}s
                             </span>
                             <div className="flex items-center gap-2">
                               <button
@@ -743,6 +863,7 @@ export default function Home() {
                       }))
                     }
                     onDuration={(duration) => {
+                      setLayerSourceDurations((prev) => ({ ...prev, [activeLayer.id]: duration }));
                       if (!layerLoopRanges[activeLayer.id]) {
                         setLayerLoopRanges((prev) => ({
                           ...prev,
@@ -761,13 +882,21 @@ export default function Home() {
                         onClick={async () => {
                           if (!activeLayer) return;
                           setDetectingLayer((prev) => ({ ...prev, [activeLayer.id]: true }));
-                          const results = await computeLoopCandidates(
-                            activeLayer.file,
-                            crossfadeDuration,
-                            3
-                          );
-                          setLayerCandidates((prev) => ({ ...prev, [activeLayer.id]: results }));
-                          setDetectingLayer((prev) => ({ ...prev, [activeLayer.id]: false }));
+                          setRenderError(null);
+                          try {
+                            const results = await computeLoopCandidates(
+                              activeLayer.file,
+                              crossfadeDuration,
+                              3
+                            );
+                            setLayerCandidates((prev) => ({ ...prev, [activeLayer.id]: results }));
+                          } catch (err: any) {
+                            const message = err?.message || "Loop detection failed.";
+                            console.error(err);
+                            setRenderError(message);
+                          } finally {
+                            setDetectingLayer((prev) => ({ ...prev, [activeLayer.id]: false }));
+                          }
                         }}
                         disabled={detectingLayer[activeLayer.id]}
                       >
@@ -782,7 +911,7 @@ export default function Home() {
                             className="flex items-center justify-between rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-xs"
                           >
                             <span className="text-white/70">
-                              {candidate.start.toFixed(2)}s → {candidate.end.toFixed(2)}s
+                              {candidate.start.toFixed(2)}s - {candidate.end.toFixed(2)}s
                             </span>
                             <div className="flex items-center gap-2">
                               <button
@@ -927,6 +1056,23 @@ export default function Home() {
                   />
                   Sample-accurate trim
                 </label>
+                <div className="mt-3 rounded-md border border-white/10 bg-white/5 px-3 py-2">
+                  <div className="flex items-center justify-between">
+                    <p className="text-[11px] uppercase tracking-[0.25em] text-app-dim">Estimated Output</p>
+                    <p className="text-sm font-semibold text-white/90">
+                      {typeof estimatedRenderSeconds === "number"
+                        ? formatDurationLabel(estimatedRenderSeconds)
+                        : "--"}
+                    </p>
+                  </div>
+                  <p className="mt-1 text-[11px] text-app-dim">
+                    {targetDraft.invalid
+                      ? "Set total duration to a value greater than 0."
+                      : hasSource
+                        ? "Calculated from current loop ranges and crossfade before render."
+                        : "Add source audio to estimate output length."}
+                  </p>
+                </div>
               </div>
 
               <div>
@@ -1074,3 +1220,4 @@ export default function Home() {
     </main>
   );
 }
+

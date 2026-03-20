@@ -48,6 +48,8 @@ export default function WaveformVisualizer({
   const [isRawLoopEnabled, setIsRawLoopEnabled] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
+  const [isLevelAnalyzing, setIsLevelAnalyzing] = useState(false);
+  const [levelInfo, setLevelInfo] = useState<{ peakDb: number; rmsDb: number } | null>(null);
   const startRawLoopAtRef = useRef<(seekTime?: number) => void>(() => {});
 
   const stopRawSource = useCallback(() => {
@@ -79,7 +81,7 @@ export default function WaveformVisualizer({
       barGap: 2,
       barRadius: 2,
       height: 140,
-      normalize: true,
+      normalize: false,
     });
 
     const url = URL.createObjectURL(file);
@@ -144,6 +146,62 @@ export default function WaveformVisualizer({
       URL.revokeObjectURL(url);
     };
   }, [file, onReady]);
+
+  useEffect(() => {
+    if (!file) {
+      setLevelInfo(null);
+      setIsLevelAnalyzing(false);
+      return;
+    }
+
+    let cancelled = false;
+    const analyzeLevel = async () => {
+      setIsLevelAnalyzing(true);
+      try {
+        const ctx = new AudioContext();
+        try {
+          const arrayBuffer = await file.arrayBuffer();
+          const decoded = await ctx.decodeAudioData(arrayBuffer);
+
+          let peak = 0;
+          let sumSquares = 0;
+          let sampleCount = 0;
+          for (let c = 0; c < decoded.numberOfChannels; c++) {
+            const channel = decoded.getChannelData(c);
+            sampleCount += channel.length;
+            for (let i = 0; i < channel.length; i++) {
+              const sample = channel[i];
+              const abs = Math.abs(sample);
+              if (abs > peak) peak = abs;
+              sumSquares += sample * sample;
+            }
+          }
+
+          const rms = sampleCount > 0 ? Math.sqrt(sumSquares / sampleCount) : 0;
+          const toDbfs = (amp: number) => Math.max(-120, 20 * Math.log10(Math.max(amp, 1e-6)));
+          const nextLevel = { peakDb: toDbfs(peak), rmsDb: toDbfs(rms) };
+          if (!cancelled) {
+            setLevelInfo(nextLevel);
+          }
+        } finally {
+          await ctx.close();
+        }
+      } catch {
+        if (!cancelled) {
+          setLevelInfo(null);
+        }
+      } finally {
+        if (!cancelled) {
+          setIsLevelAnalyzing(false);
+        }
+      }
+    };
+
+    void analyzeLevel();
+    return () => {
+      cancelled = true;
+    };
+  }, [file]);
 
   const setWaveSurferMuted = useCallback((muted: boolean) => {
     const ws = wavesurferRef.current;
@@ -319,6 +377,8 @@ export default function WaveformVisualizer({
       .padStart(2, "0")}`;
   };
 
+  const formatDb = (value: number) => `${value.toFixed(1)} dBFS`;
+
   const loopStartValue = typeof loopStart === "number" ? loopStart : 0;
   const loopEndValue = typeof loopEnd === "number" ? loopEnd : duration;
   const safeLoopStart = Math.max(0, Math.min(loopStartValue, duration || 0));
@@ -348,6 +408,18 @@ export default function WaveformVisualizer({
       <div className="flex items-center justify-between text-xs text-white/60">
         <span>{formatTime(currentTime)}</span>
         <span>{formatTime(duration)}</span>
+      </div>
+      <div className="flex items-center justify-between text-[11px] text-white/50">
+        {isLevelAnalyzing ? (
+          <span>Level: analyzing...</span>
+        ) : levelInfo ? (
+          <>
+            <span>Peak {formatDb(levelInfo.peakDb)}</span>
+            <span>RMS {formatDb(levelInfo.rmsDb)}</span>
+          </>
+        ) : (
+          <span>Level: unavailable</span>
+        )}
       </div>
 
       {showLoopRange && duration > 0 && (
